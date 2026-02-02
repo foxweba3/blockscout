@@ -1,4 +1,182 @@
-name: antiscam
+name: Antiscam (enhanced)
+
+on:
+  issue_comment:
+    types: [created, edited]
+  discussion_comment:
+    types: [created, edited]
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  pull_request_review_comment:
+    types: [created, edited]
+  schedule:
+    - cron: "0 2 * * *" # רוץ כל יום בשעה 02:00 UTC
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+  discussions: write
+
+concurrency:
+  group: antiscam-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  antiscam:
+    name: Antiscam detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCAM_ACTION_WHITELISTED_LOGINS: ${{ vars.SCAM_ACTION_WHITELISTED_LOGINS }} # נגיד "bot1,maintainer1"
+      SCAM_ACTION_FAIL_JOB: ${{ vars.SCAM_ACTION_FAIL_JOB || 'false' }}        # 'true' להכשיל את ה-job על גילוי
+      SCAM_ACTION_AUTO_CLOSE: ${{ vars.SCAM_ACTION_AUTO_CLOSE || 'false' }}    # 'true' לסגור אוטומטית
+      SCAM_ACTION_MAINTAINERS: ${{ vars.SCAM_ACTION_MAINTAINERS || '' }}      # אופציונלי: תגיות/מנטיונס
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run upstream antiscam action
+        id: antiscam
+        uses: vbaranov/antiscam-action@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          SCAM_ACTION_WHITELISTED_LOGINS: ${{ vars.SCAM_ACTION_WHITELISTED_LOGINS }}
+
+      - name: Detect suspicious content (heuristic backup)
+        id: detect
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const payload = github.context.payload || {};
+            // get text from possible sources
+            const text = (
+              payload.comment?.body ||
+              payload.review?.body ||
+              payload.review?.body_html ||
+              payload.issue?.body ||
+              payload.pull_request?.body ||
+              ""
+            ).toString();
+            const author = (
+              payload.comment?.user?.login ||
+              payload.review?.user?.login ||
+              payload.issue?.user?.login ||
+              payload.pull_request?.user?.login ||
+              payload.sender?.login ||
+              ""
+            ).toString();
+
+            const whitelistRaw = process.env.SCAM_ACTION_WHITELISTED_LOGINS || "";
+            const whitelist = whitelistRaw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+            if (author && whitelist.includes(author.toLowerCase())) {
+              return JSON.stringify({ suspicious: false, reason: "author_whitelisted", author });
+            }
+
+            const lowered = text.toLowerCase();
+            const keywords = /(scam|fraud|phish|giveaway|airdrop|claim (your|the)|private key|seed phrase|send (us|to) (crypto|ether|eth|btc)|verify identity|click here to claim)/i;
+            const urlRegex = /https?:\/\/[^\s/$.?#].[^\s]*/i;
+            const suspiciousUrlIndicators = /(free|claim|reward|verify|tinyurl|bit\.ly|discord\.gg|t\.me\/|telegram\.me|claimnow)/i;
+
+            let suspicious = false;
+            let reason = "no_match";
+
+            if (keywords.test(lowered)) {
+              suspicious = true;
+              reason = "keyword_match";
+            } else if (urlRegex.test(lowered) && suspiciousUrlIndicators.test(lowered)) {
+              suspicious = true;
+              reason = "suspicious_url";
+            } else if (urlRegex.test(lowered) && lowered.includes("private key")) {
+              suspicious = true;
+              reason = "url_and_private_key";
+            }
+
+            return JSON.stringify({ suspicious, reason, author, excerpt: lowered.slice(0, 800) });
+        env:
+          SCAM_ACTION_WHITELISTED_LOGINS: ${{ vars.SCAM_ACTION_WHITELISTED_LOGINS }}
+
+      - name: Save detection result artifact
+        if: ${{ always() }}
+        run: |
+          echo '${{ steps.detect.outputs.result }}' > antiscam-detect-result.json
+        shell: bash
+
+      - name: Upload detection artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: antiscam-detection-${{ github.run_id }}
+          path: antiscam-detect-result.json
+
+      - name: Add label and comment when suspicious
+        if: ${{ fromJSON(steps.detect.outputs.result).suspicious == true }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const result = JSON.parse(process.env.DETECT_RESULT || '{}');
+            const issue_number = github.context.issue?.number || github.context.payload.pull_request?.number;
+            const owner = github.context.repo.owner;
+            const repo = github.context.repo.repo;
+
+            if (!issue_number) {
+              core.info("No issue/PR number found in context; skipping label/comment.");
+              return;
+            }
+
+            // add a label (creates it if missing if repo allows)
+            try {
+              await github.issues.addLabels({
+                owner,
+                repo,
+                issue_number,
+                labels: ["antiscam"]
+              });
+            } catch (e) {
+              core.info("Could not add label: " + e.message);
+            }
+
+            const maintainers = process.env.SCAM_ACTION_MAINTAINERS || "";
+            const mention = maintainers ? ` ${maintainers}` : "";
+            const body = `🔍 Suspicious content detected (${result.reason}). Maintainers, please review.${mention}\n\nExcerpt:\n\`\`\`\n${result.excerpt}\n\`\`\``;
+
+            await github.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body
+            });
+        env:
+          DETECT_RESULT: ${{ steps.detect.outputs.result }}
+          SCAM_ACTION_MAINTAINERS: ${{ vars.SCAM_ACTION_MAINTAINERS || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-close issue/PR when suspicious (optional)
+        if: ${{ fromJSON(steps.detect.outputs.result).suspicious == true && vars.SCAM_ACTION_AUTO_CLOSE == 'true' }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issue_number = github.context.issue?.number || github.context.payload.pull_request?.number;
+            const owner = github.context.repo.owner;
+            const repo = github.context.repo.repo;
+            if (!issue_number) return;
+            await github.issues.update({
+              owner,
+              repo,
+              issue_number,
+              state: "closed"
+            });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail the job on detection (optional)
+        if: ${{ fromJSON(steps.detect.outputs.result).suspicious == true && vars.SCAM_ACTION_FAIL_JOB == 'true' }}
+        run: |
+          echo "Scam detected and SCAM_ACTION_FAIL_JOB=true — failing job intentionally."
+          exit 1
+          name: antiscam
 
 on:
   issue_comment:
